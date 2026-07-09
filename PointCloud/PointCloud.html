@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>Real-time 3D Point Cloud Viewer</title>
+    <script src="./libs/three.min.js"></script>
+    <script src="./libs/controls/OrbitControls.js"></script>
+    <script src="./libs/loaders/GLTFLoader.js"></script>
+    <style>
+        html, body {
+            margin: 0; padding: 0; height: 100%;
+            background-color: #3c3c3c; overflow: hidden;
+        }
+        #viewer { width: 100%; height: 100vh; background: #111; border-radius: 8px; margin-top: 12px; }
+        
+        /* 디버깅 모드를 위한 UI 스타일링 (프로덕션에서는 완전 투명 영역으로 숨김 처리 가능) */
+        .invisible-btn {
+          width: 120px; height: 30px;
+          background: #c8c8c8; border: 0; opacity: 0;
+          cursor: pointer; pointer-events: auto;
+        }
+        .invisible-btn:hover,
+        .invisible-btn:focus-visible {
+          outline: 2px dashed #09f; outline-offset: 4px; opacity: .2;
+        }
+        .debug-btn {
+          width: 120px; height: 30px; background: #c8c8c8; border: 0; opacity: 1;
+          cursor: pointer; pointer-events: auto;
+        }
+    </style>
+</head>
+<body>
+
+<button id="Debug_Mode" style="position: absolute; z-index: 2; left: 5px; top: 5px; width: 60px;" class="invisible-btn" aria-label="Debug_Mode">Debug</button>
+
+<div class="status" id="status" style="display: none;">대기중</div>
+<div id="Debug_Btns" style="position: absolute; z-index: 2; left: 70px; top: 5px; display: none;">
+    <button class="debug-btn" onclick="loadSimulationDemo(1)">샘플 데이터 A</button>
+    <button class="debug-btn" onclick="loadSimulationDemo(2)">샘플 데이터 B</button>
+    <button class="debug-btn" onclick="resetButtonAction()">리셋</button>
+</div>
+<div id="viewer" style="display:none"></div>
+
+<div id="fps" style="position: fixed; top: 5px; right: 5px; color: rgb(255, 0, 0); font-family: monospace; display: none;"></div>
+<div id="log" style="position: fixed; top: 50px; left: 15px; color: rgb(255, 0, 0); font-family: monospace; display: none;">
+    <div id="rotate">Rotation</div><br>
+    <div id="zoom">Zoom</div>
+</div>
+
+<script>
+    /**
+     * [1] 디버그 모드 및 런타임 성능(FPS) 계측 스크립트
+     */
+    let isDebugMode = false;
+
+    document.getElementById('Debug_Mode').addEventListener('click', () => {
+        isDebugMode = !isDebugMode;
+        onChangeDebugMode();
+    });
+
+    function onChangeDebugMode() {
+        const element = document.getElementById('Debug_Btns');
+        if (element) element.style.display = isDebugMode ? 'block' : 'none';
+        
+        const trigger = document.getElementById('Debug_Mode');
+        if (trigger) trigger.style.opacity = isDebugMode ? 1 : 0;
+        
+        const logEl = document.getElementById("log");
+        if (logEl) logEl.style.display = isDebugMode ? 'block' : 'none';
+    }
+
+    // FPS Counter 로직 (애니메이션 프레임 드랍 감지)
+    let lastPerformanceTime = performance.now();
+    let frameCount = 0;
+    let currentFps = 0;
+    const fpsBox = document.getElementById("fps");
+
+    function calculateFps(now) {
+        frameCount++;
+        const delta = now - lastPerformanceTime;
+        if (delta >= 1000) {
+            currentFps = (frameCount * 1000 / delta).toFixed(1);
+            fpsBox.textContent = `FPS: ${currentFps}`;
+            frameCount = 0;
+            lastPerformanceTime = now;
+        }
+        requestAnimationFrame(calculateFps);
+    }
+    requestAnimationFrame(calculateFps);
+</script>
+
+<script>
+    /**
+     * [2] 하이브리드 앱 인프라 - Native-Web Bridge 통신 레이어
+     */
+    window.addEventListener('message', function(event) {
+        const message = event.data;
+        try {
+            switch(message.type) {
+                case 'processPointCloudData': // 네이티브로부터의 바이너리 데이터 수신 이벤트
+                    try {
+                        streamFromJsonBase64(message.data);
+                    } catch (e) {
+                        console.warn('[Point Cloud] Base64 parse error:', e);
+                    }
+                    break;
+                case 'resetPointCloud':
+                    resetPointCloud();
+                    break;
+            }
+        } catch (e) {
+            console.warn('[Point Cloud] Message handling error:', e);
+            logStatus(`error: ${e.message}`);
+        }
+    });
+
+    let isDataLoading = false;
+
+    function startPointCloud() {
+        console.log('[System] Pipeline Started');
+        requestNativeData();
+    }
+
+    function stopPointCloud() {
+        console.log('[System] Pipeline Stopped');
+        resetPointCloud();
+    }
+
+    // 하드웨어/플랫폼 네이티브 인터페이스 호출부 (마스킹 처리)
+    function requestNativeData() {
+        const isAndroidBridgeAvailable = (typeof AppNativeBridge !== 'undefined' && AppNativeBridge.get3DPointCloudData);
+        if (isAndroidBridgeAvailable) {
+            console.log("[System] Requesting Data via Native Bridge...");
+            AppNativeBridge.get3DPointCloudData();
+        } else {
+            // 웹 독립 실행(Standalone 환경)일 경우 시뮬레이션 모드로 폴백
+            running = false;
+            loadSimulationDemo(2);
+        }
+    }
+
+    /**
+     * [3] 3D Graphics Engine 레이어 (Three.js 핵심 상태 관리 객체)
+     */
+    const viewer = document.getElementById('viewer');
+    const status = document.getElementById('status');
+
+    // 메모리 가비지 컬렉션(GC) 최소화 및 싱글톤 구조의 전역 3D 상태 트리
+    const threeState = {
+        inited: false,
+        renderer: null,
+        scene: null,
+        camera: null,
+        controls: null,
+        geom: null,
+        posAttr: null,
+        colAttr: null,
+        pointsObj: null,
+
+        maxPoints: 2_000_000,   // GPU 버퍼 최적화를 위해 VRAM 고정 메모리 최대 크기 할당 (최대 200만개 정점)
+        writeOffset: 0,        // 시퀀스 데이터 적재를 위한 버퍼 포인터 가리키기
+        stride: 0,             // 데이터 포맷 스트라이드 크기 (바이너리 파싱 자동 감지 결과 저장)
+        littleEndian: true,    // 엔디안 포맷 플래그
+
+        min: [Infinity,  Infinity, Infinity],
+        max: [-Infinity, -Infinity, -Infinity],
+
+        cameraPrimed: false,   // 초기 카메라 포커싱 완료 여부
+        ring: true,            // 메모리 한계 도달 시 링 버퍼(환형 구조) 순환 여부
+        robotObject: null      // 동기화할 에이전트 3D 객체(Mesh)
+    };
+
+    let running = false;
+    const zoomLog = document.getElementById("zoom");
+    const rotateLog = document.getElementById("rotate");
+    let lastFollowPos = new THREE.Vector3();
+
+    /**
+     * [4] WebGL Context 및 3D Scene 초기화 (최초 1회만 실행)
+     */
+    function initThreeOnce() {
+        if (threeState.inited) return;
+        viewer.style.display = 'block';
+
+        const w = viewer.clientWidth || window.innerWidth;
+        const h = viewer.clientHeight || window.innerHeight;
+
+        // 고성능 옵션 지정 및 필요 없는 연산(Antialias, Alpha)을 꺼서 모바일 기기 프레임 확보
+        const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: 'high-performance' });
+        renderer.setPixelRatio(Math.min(1, window.devicePixelRatio));
+        renderer.setSize(w, h);
+        viewer.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x3c3c3c);
+
+        const camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 100000);
+        camera.position.set(0, 20, 20);
+        
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = false;
+        controls.minDistance = 10;
+        controls.maxDistance = 50;
+
+        // 고성능 실시간 렌더링을 위해 동적 버퍼 어트리뷰트(BufferAttribute) 사전 가용화
+        const geom = new THREE.BufferGeometry();
+        const posArr = new Float32Array(threeState.maxPoints * 3); // X, Y, Z 정점 버퍼
+        const colArr = new Float32Array(threeState.maxPoints * 4); // R, G, B, A 컬러 버퍼
+
+        const posAttr = new THREE.BufferAttribute(posArr, 3);
+        posAttr.setUsage(THREE.DynamicDrawUsage); // 매 프레임 스트리밍되는 데이터임을 GPU에 명시
+
+        const colAttr = new THREE.BufferAttribute(colArr, 4);
+        colAttr.setUsage(THREE.DynamicDrawUsage);
+
+        for (let i = 0; i < colArr.length; i++) colArr[i] = 0.75; // 기본 색상 회색 셋업
+
+        geom.setAttribute('position', posAttr);
+        geom.setAttribute('color', colAttr);
+        geom.setDrawRange(0, 0); // 초기 데이터 개수 0으로 시작
+
+        // 텍스처 매핑 및 머티리얼 정의를 통한 하이퍼포먼스 입자(Points) 생성
+        const pts = new THREE.Points(geom, new THREE.PointsMaterial({
+            size: 0.1, vertexColors: true, sizeAttenuation: true
+        }));
+        scene.add(pts);
+
+        // 자산 경로 및 데이터 모델 마스킹 처리 (GLTF 디바이스 모델 로드)
+        const loader = new THREE.GLTFLoader();
+        loader.load(
+            './Models/custom_robot_model.glb', 
+            (gltf) => {
+                const model = gltf.scene;
+                model.traverse((obj) => {
+                    if (obj.isMesh) {
+                        // 기본 라이팅 연산 비용을 아끼기 위해 Unlit 계열인 MeshBasicMaterial로 치환 최적화
+                        const oldMat = obj.material;
+                        obj.material = new THREE.MeshBasicMaterial({
+                            map: oldMat.map || null,
+                            color: oldMat.color || new THREE.Color(0xffffff),
+                            transparent: oldMat.transparent ?? false,
+                            opacity: oldMat.opacity ?? 1,
+                            side: oldMat.side ?? THREE.FrontSide
+                        });
+                        obj.castShadow = false;
+                        obj.receiveShadow = false;
+                    }
+                });
+                model.scale.set(2, 2, 2);
+                scene.add(model);
+                threeState.robotObject = model;
+                threeState.robotObject.visible = false;
+            },
+            undefined,
+            (err) => console.error('Model load error:', err.toString())
+        );
+
+        // 원형 부드러운 입자 표현을 위한 2D 절차적 캔버스 가짜 텍스처 적용 (GPU 연산 최소화)
+        const mat = pts.material;
+        mat.map = makeCircleTexture(32, 0.48, 0.15);
+        mat.alphaTest = 0.5;
+        mat.transparent = true;
+        mat.needsUpdate = true;
+
+        // 최적의 렌더 루프 가동
+        (function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        })();
+
+        // Canvas 2D를 사용한 동적 그라데이션 텍스처 빌더
+        function makeCircleTexture(size = 64, radius = 0.48, feather = 0.08) {
+            const c = document.createElement('canvas');
+            c.width = c.height = size;
+            const ctx = c.getContext('2d');
+            ctx.clearRect(0, 0, size, size);
+
+            const g = ctx.createRadialGradient(size/2, size/2, radius*size*(1-feather), size/2, size/2, radius*size);
+            g.addColorStop(0, 'rgba(255,255,255,1)');
+            g.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = g;
+            ctx.beginPath();
+            ctx.arc(size/2, size/2, radius*size, 0, Math.PI * 2);
+            ctx.fill();
+
+            const tex = new THREE.CanvasTexture(c);
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = false;
+            return tex;
+        }
+
+        // 반응형 레이아웃 윈도우 리사이즈 바인딩
+        window.addEventListener('resize', () => {
+            const W = viewer.clientWidth || window.innerWidth;
+            const H = viewer.clientHeight || window.innerHeight;
+            renderer.setSize(W, H);
+            camera.aspect = W / H;
+            camera.updateProjectionMatrix();
+        });
+
+        Object.assign(threeState, {
+            inited: true, renderer, scene, camera, controls, geom, posAttr, colAttr, pointsObj: pts
+        });
+        initFollow(new THREE.Vector3());
+        logStatus('ready (streaming mode)');
+    }
+
+    /**
+     * [5] Binary Data Parser & Stride Detector
+     * 스트리밍 데이터 구조 분석을 위해 바이너리 버퍼 헤더와 데이터 필드의 유효 패킷 단위(Stride)를 가변 분석하는 지능형 알고리즘
+     */
+    function detectStride(dv, byteLen) {
+        const candidates = [];
+        for (let s = 3; s <= 8; s++) {
+            if (byteLen % (s * 4) !== 0) continue;
+            const count = byteLen / (s * 4);
+            if (count < 1) continue;
+            const sampleN = Math.min(500, count);
+            let plausible = 0;
+            
+            // 데이터 표본 분석을 통해 비정상적인 부동소수점 값 검출 알고리즘
+            for (let i = 0; i < sampleN; i++) {
+                const base = i * s * 4;
+                const x = dv.getFloat32(base + 0*4, true);
+                const y = dv.getFloat32(base + 1*4, true);
+                const z = dv.getFloat32(base + 2*4, true);
+                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+                if (Math.abs(x) > 1e7 || Math.abs(y) > 1e7 || Math.abs(z) > 1e7) continue;
+                if (Math.abs(x) < 1e-12 && Math.abs(y) < 1e-12 && Math.abs(z) < 1e-12) continue;
+                plausible++;
+            }
+            candidates.push({ s, p: plausible / sampleN, count });
+        }
+        candidates.sort((a, b) => (b.p - a.p) || (b.count - a.count));
+        if (!candidates.length) throw new Error('No stride candidate found');
+        return candidates[0].s;
+    }
+
+    function updateMinMaxBounds(x, y, z) {
+        if (x < threeState.min[0]) threeState.min[0] = x;
+        if (y < threeState.min[1]) threeState.min[1] = y;
+        if (z < threeState.min[2]) threeState.min[2] = z;
+        if (x > threeState.max[0]) threeState.max[0] = x;
+        if (y > threeState.max[1]) threeState.max[1] = y;
+        if (z > threeState.max[2]) threeState.max[2] = z;
+    }
+
+    /**
+     * [6] High-Performance GPU Memory Buffer Writer
+     * 바이너리 데이터를 직접 파싱하여 VRAM에 할당된 ArrayBuffer에 무복사(Zero-copy) 컨셉으로 고속 매핑하는 핵심 함수
+     */
+    function writeChunkPositionsAndColors(dv, stride, count, littleEndian) {
+        const pos = threeState.posAttr.array;
+        const col = threeState.colAttr.array;
+
+        let start = threeState.writeOffset;
+        let remaining = threeState.maxPoints - start;
+        const canWrite = Math.min(count, remaining);
+
+        for (let i = 0; i < canWrite; i++) {
+            const base = i * stride * 4;
+            // Native 센서 좌표계 정합성에 맞게 축 가공 (X, Z, Y 매핑)
+            const x = dv.getFloat32(base + 0 * 4, littleEndian);
+            const z = dv.getFloat32(base + 1 * 4, littleEndian);
+            const y = dv.getFloat32(base + 2 * 4, littleEndian);
+            
+            // 32비트 정수 패킷에서 비트 연산(Bitwise operations)으로 RGBA 값 디코딩 추출
+            const rgba = dv.getUint32(base + 16, littleEndian);
+            
+            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+            
+            const R =  rgba        & 0xFF;
+            const G = (rgba >>> 8) & 0xFF;
+            const B = (rgba >>> 16) & 0xFF;
+            const A = (rgba >>> 24) & 0xFF;
+
+            const pi = (start + i) * 3;
+            const pi2 = (start + i) * 4;
+            
+            pos[pi + 0] = x; pos[pi + 1] = y; pos[pi + 2] = z;
+            col[pi2 + 0] = R / 255; col[pi2 + 1] = G / 255; col[pi2 + 2] = B / 255; col[pi2 + 3] = A / 255;
+
+            // 시퀀스의 특정 청크 종단 인덱스에서 메타데이터(에이전트 위치/회전) 축출 및 반영
+            if (i === (canWrite - 1)) {
+                updateCameraPos(x, y, z);
+            }
+            if (i === (canWrite - 2)) {
+                // 패킷 내 기정의된 하위 바이트 구조로부터 Roll, Pitch, Yaw 오일러각 디코딩
+                updateRobotRotation(x, y, z); 
+            }
+            
+            updateMinMaxBounds(x, y, z);
+        }
+
+        // 환형 버퍼(Ring Buffer) 구현 레이어: 대용량 적재 시 데이터 메모리 오버플로우 관리
+        const remainCount = count - canWrite;
+        if (remainCount > 0 && threeState.ring) {
+            start = 0;
+            for (let i = 0; i < remainCount; i++) {
+                const base = (canWrite + i) * stride * 4;
+                const x = dv.getFloat32(base + 0 * 4, littleEndian);
+                const z = dv.getFloat32(base + 1 * 4, littleEndian);
+                const y = dv.getFloat32(base + 2 * 4, littleEndian);
+                const rgba = dv.getUint32(base + 16, littleEndian);
+
+                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+
+                const R =  rgba        & 0xFF;
+                const G = (rgba >>> 8) & 0xFF;
+                const B = (rgba >>> 16) & 0xFF;
+                const A = (rgba >>> 24) & 0xFF;
+
+                const pi = (start + i) * 3;
+                const pi2 = (start + i) * 4;
+                pos[pi + 0] = x; pos[pi + 1] = y; pos[pi + 2] = z;
+                col[pi2 + 0] = R / 255; col[pi2 + 1] = G / 255; col[pi2 + 2] = B / 255; col[pi2 + 3] = A / 255;
+                updateMinMaxBounds(x, y, z);
+            }
+        }
+
+        // 드로우 콜(Draw Call) 범위 계산 및 GPU 플러시 트리거 명시
+        if (threeState.ring && remainCount > 0) {
+            threeState.writeOffset = remainCount;
+            threeState.geom.setDrawRange(0, threeState.maxPoints);
+        } else {
+            threeState.writeOffset += (canWrite + (threeState.ring ? Math.max(0, remainCount) : 0));
+            threeState.geom.setDrawRange(0, threeState.writeOffset);
+        }
+
+        threeState.pointsObj.frustumCulled = false; // 절두체 컬링을 비활성화하여 실시간 스트리밍 시 깜빡임 현상 제거
+        threeState.posAttr.needsUpdate = true;      // WebGL 컨텍스트에 버퍼 갱신 플래그 전달
+        threeState.colAttr.needsUpdate = true;
+
+        // 최초 시점 자동 구도 추적 (Initial Calibration)
+        if (!threeState.cameraPrimed && threeState.writeOffset > 0) {
+            if (threeState.robotObject != null) threeState.robotObject.visible = true;
+            threeState.cameraPrimed = true;
+        }
+    }
+
+    function processBuffer(buf, strideOpt, littleEndianOpt) {
+        initThreeOnce();
+        const dv = new DataView(buf);
+        const byteLen = buf.byteLength;
+        if (!threeState.stride) {
+            threeState.stride = strideOpt || detectStride(dv, byteLen);
+        }
+        threeState.littleEndian = (littleEndianOpt !== undefined) ? !!littleEndianOpt : true;
+
+        const stride = threeState.stride;
+        const count = (byteLen / (stride * 4)) | 0;
+        writeChunkPositionsAndColors(dv, stride, count, threeState.littleEndian);
+
+        logStatus(`streaming: stride=${stride}, total=${threeState.writeOffset}/${threeState.maxPoints}`);
+    }
+
+    function resetPointCloud() {
+        initThreeOnce();
+        threeState.writeOffset = 0;
+        threeState.stride = 0;
+        threeState.min = [Infinity, Infinity, Infinity];
+        threeState.max = [-Infinity, -Infinity, -Infinity];
+        threeState.cameraPrimed = false;
+        if (threeState.robotObject != null) threeState.robotObject.visible = false;
+        
+        threeState.geom.setDrawRange(0, 0);
+        running = false;
+        logStatus('reset');
+    }
+
+    // Base64 문자열을 고속 가공하여 고성능 바이너리 ArrayBuffer 객체로 환원하는 유틸 함수
+    function base64ToArrayBuffer(base64) {
+        base64 = base64.replace(/-/g, '+').replace(/_/g, '/');
+        const pad = base64.length % 4;
+        if (pad) base64 += '='.repeat(4 - pad);
+        const binary_string = atob(base64);
+        const len = binary_string.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = binary_string.charCodeAt(i);
+        return bytes.buffer;
+    }
+
+    /**
+     * [7] Stream Controller & Non-blocking Chunk Chaining
+     * 웹 애플리케이션의 메인 스레드가 대용량 직렬화 데이터를 파싱할 때 프리징 현상(UI 블로킹)이 발생하는 것을 막기 위해
+     * 청크 단위를 슬라이싱하여 비동기(setTimeout 16ms Task 분할)적으로 처리하는 스케줄러 구현층
+     */
+    async function streamFromJsonBase64(data) {
+        if (!running) return;
+        initThreeOnce();
+        const base64 = data;
+        if (!base64) return;
+        
+        const buf = base64ToArrayBuffer(base64);
+        const dv = new DataView(buf);
+        const byteLen = buf.byteLength;
+        const stride = data.stride ?? detectStride(dv, byteLen);
+        
+        const chunkPts = 50_000; // 싱글 틱 프레임당 최대로 연산할 버퍼 크기 파티셔닝
+        const chunkBytes = chunkPts * stride * 4;
+        
+        for (let off = 0; off < byteLen; off += chunkBytes) {
+            if (!running) break;
+
+            const end = Math.min(off + chunkBytes, byteLen);
+            const slice = buf.slice(off, end);
+            processBuffer(slice, stride, true);
+
+            // 약 60fps 인터벌을 유지하며 브라우저 가상 이벤트 루프에 제어권을 양보(Yielding)함으로서 UI 반응성 극대화
+            await new Promise(r => setTimeout(r, 16)); 
+        }
+        maybeUpdateBoundingSphere();
+    }
+
+    let lastBoundingSphereUpdateTime = performance.now();
+    function maybeUpdateBoundingSphere() {
+        const now = performance.now();
+        if (now - lastBoundingSphereUpdateTime > 500) { // 연산 비용 절감을 위해 바운딩 스피어는 500ms 단위로 스로틀링 갱신
+            threeState.geom.computeBoundingSphere();
+            lastBoundingSphereUpdateTime = now;
+        }
+    }
+
+    async function getPointCloudDataDelay() {
+        await new Promise(r => setTimeout(r, 1000));
+        requestNativeData();
+    }
+
+    function logStatus(s, warn = false) {
+        status.textContent = s;
+        status.className = warn ? 'status warning' : 'status';
+    }
+
+    function resetButtonAction() {
+        resetPointCloud();
+    }
+
+    // 라이프사이클 이니셜라이저 작동
+    resetPointCloud();
+    startPointCloud();
+
+    /**
+     * [8] 3D Camera & Agent Transform Synchronizer
+     * 에이전트의 이동 경로 델타 값을 추적해 3D 월드의 카메라 뷰와 앵커 타겟을 동시 추종하도록 유지하는 매커니즘
+     */
+    function updateCameraPos(x, y, z) {
+        if (threeState.camera != null) {
+            const currentPos = new THREE.Vector3(x, y, z);
+            const delta = new THREE.Vector3().subVectors(currentPos, lastFollowPos);
+
+            // 카메라와 궤적 조작부(OrbitControls Target)에 변위 벡터 동시 합성 적용
+            threeState.camera.position.add(delta);
+            threeState.controls.target.add(delta);
+
+            if (threeState.robotObject != null) threeState.robotObject.position.add(delta);
+
+            lastFollowPos.copy(currentPos);
+        }
+    }
+
+    function updateRobotRotation(x, y, z) {
+        if (threeState.robotObject != null) {
+            // YXZ 다이내믹 오일러 회전 순서 체계를 쿼터니언(Quaternion)으로 변환하여 짐벌락 현상 사전 방지
+            const euler = new THREE.Euler(y, z, x, "YXZ");
+            threeState.robotObject.quaternion.setFromEuler(euler);
+        }
+    }
+
+    function initFollow(initialPos) {
+        lastFollowPos.copy(initialPos);
+        if (threeState.controls != null) {
+            threeState.controls.target.copy(initialPos);
+            threeState.controls.update();
+        }
+    }
+
+    /**
+     * [9] 포트폴리오 검증용 가상 시뮬레이터 구동 레이어 (Mockup Simulator)
+     */
+    async function loadSimulationDemo(type) {
+        if (running) return;
+        running = true;
+
+        if (type === 1) {
+            // 단일 대용량 정적 로드 시뮬레이션
+            const samplePath = './json/cloud_data_sample.json';
+            const j = await (await fetch(samplePath)).json();
+            streamFromJsonBase64(j.data);
+        } else {
+            // 시계열 데이터 파이프라인 프레임 스트리밍 시뮬레이션 (100ms 단위 실시간 순차 주입)
+            for (let i = 0; i < 79; i++) {
+                if (!running) break;
+                const idx = String(i).padStart(2, "0");
+                const path = `./json/step/simulation_frame_${idx}.json`;
+                try {
+                    const j = await (await fetch(path)).json();
+                    streamFromJsonBase64(j.data);
+                } catch(e) {
+                    console.warn("Simulation step skip:", idx);
+                }
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }
+    }
+
+    // 카메라 기하 정보 대시보드 실시간 반영 스트림 루프
+    function updateLogData() {
+        if (threeState.camera != null) {
+            const target = threeState.controls.target;
+            const offset = new THREE.Vector3().copy(threeState.camera.position).sub(target);
+            const spherical = new THREE.Spherical();
+            spherical.setFromVector3(offset);
+            
+            rotateLog.textContent = `rotation : (theta : ${THREE.MathUtils.radToDeg(spherical.theta).toFixed(0)}°, phi : ${THREE.MathUtils.radToDeg(spherical.phi).toFixed(0)}°)`;
+            if (target != null) {
+                zoomLog.textContent = `zoom : ${threeState.camera.position.distanceTo(target).toFixed(0)}`;
+            }
+        }
+        requestAnimationFrame(updateLogData);
+    }
+    requestAnimationFrame(updateLogData);
+</script>
+
+</body>
+</html>
