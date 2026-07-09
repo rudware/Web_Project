@@ -1,2 +1,2 @@
 # Web_Project
-Web기반 작업 내
+Web기반 작업 내역
